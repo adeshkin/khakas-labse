@@ -4,10 +4,11 @@ import gc
 import pandas as pd
 from datetime import datetime
 from transformers.optimization import Adafactor
-from transformers import AutoTokenizer, AutoModelForPreTraining
+from transformers import AutoTokenizer, AutoModelForPreTraining, AutoModel, DataCollatorForWholeWordMask
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import os
+from tqdm.auto import tqdm, trange
 
 from preprocess_text import preproc
 
@@ -136,8 +137,10 @@ def main():
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-            losses.append(loss.item())
+            loss_value = loss.item()
             acc_value = get_acc(embeddings)
+
+            losses.append(loss_value)
             accuracies.append(acc_value)
         except RuntimeError:
             optimizer.zero_grad(set_to_none=True)
@@ -150,18 +153,160 @@ def main():
             print('\nKeyboardInterrupt detected.')
             break
 
-        if i % 100 == 0 and i > 0:
-            writer.add_scalar("train/loss", loss.item(), i)
-            writer.add_scalar("train/loss_mean_100", np.mean(losses[-100:]), i)
+        if i % 1000 == 0 and i > 0:
+            writer.add_scalar("train/loss", loss_value, i)
+            writer.add_scalar("train/loss_mean_100", np.mean(losses[-1000:]), i)
             writer.add_scalar("train/accuracy", acc_value, i)
-            writer.add_scalar("train/accuracy_mean_100", np.mean(accuracies[-100:]), i)
+            writer.add_scalar("train/accuracy_mean_100", np.mean(accuracies[-1000:]), i)
             writer.flush()
 
-            print(f"Step {i} | Loss: {np.mean(losses[-100:]):.4f} (Acc: {np.mean(accuracies[-100:]):.4f})\n")
-            last_model_path = f"{model_dir}/last-{i}"
-            model.save_pretrained(last_model_path)
+            print(f"Step {i} | Loss: {np.mean(losses[-1000:]):.4f} | Accuracy: {np.mean(accuracies[-1000:]):.4f}\n")
 
+    model_path = f"{model_dir}/labse_kjh_ru_v0"
+    model.save_pretrained(model_path)
     writer.close()
+
+
+def get_acc2(e1, e2):
+    batch_size = e1.shape[0]
+    with torch.no_grad():
+        scores = torch.matmul(e1, e2.T).cpu().numpy()
+    a1 = (scores.argmax(1) == np.arange(batch_size)).mean()
+    a2 = (scores.argmax(0) == np.arange(batch_size)).mean()
+    return (a1 + a2) / 2
+
+
+def corrupt_sentence(sent, ix, p_edit=0.5):
+    sent = sent.split()
+    old_sent = sent[:]
+    while sent == old_sent:
+        # insert a random word
+        if random.random() < p_edit or len(sent) == 1:
+            other_sent = random.choice(all_pairs)[ix].split()
+            sent.insert(random.randint(0, len(sent) - 1), random.choice(other_sent))
+        # replace a random word
+        if random.random() < p_edit and len(sent) > 1:
+            other_sent = random.choice(all_pairs)[ix].split()
+            sent[random.randint(0, len(sent) - 1)] = random.choice(other_sent)
+        # remove a word
+        if random.random() < p_edit and len(sent) > 1:
+            sent.pop(random.randint(0, len(sent) - 1))
+        # swap words
+        if random.random() < p_edit and len(sent) > 1:
+            i, j = random.sample(range(len(sent)), 2)
+            sent[i], sent[j] = sent[j], sent[i]
+    return ' '.join(sent)
+
+
+def corrupt_pair(pair):
+    """ Corrupt one (randomly chosen) sentence in a pair """
+    pair = list(pair)
+    ix = random.choice([0, 1])
+    sent = pair[ix]
+    pair[ix] = corrupt_sentence(sent, ix)
+    return pair
+
+
+def get_pairs_batch(bs=4):
+    pp = random.choices(short_pairs, k=int(np.ceil(bs / 2)))
+    labels = [1] * len(pp) + [0] * len(pp)
+    if random.random() < 0.5:
+        # make negatives by swapping sentence with a random one
+        pp.extend([(pp[i][0], pp[i - 1][1]) for i in range(len(pp))])
+    else:
+        # make negatives by corrupting existing sentences
+        pp.extend([corrupt_pair(p) for p in pp])
+    pp = [[x, y] if random.random() < 0.5 else [y, x] for x, y in pp]
+
+    return [list(t) for t in zip(*pp)], labels
+
+
+def train1():
+    base_model_name = 'labse_erzya_v0'
+    all_pairs = []
+    model = AutoModelForPreTraining.from_pretrained(base_model_name).cuda()
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    pair_lens = [len(tokenizer.encode(*p)) for p in tqdm(all_pairs)]
+    print(pd.Series(pair_lens).quantile([0.5, 0.75, 0.9, 0.95, 0.99, 1]))
+    short_pairs = [p for p in tqdm(all_pairs) if len(tokenizer.encode(*p)) <= 100]
+    print(len(all_pairs), len(short_pairs))
+
+    teacher_model_name = 'cointegrated/LaBSE-en-ru'
+    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_name)
+    teacher_model = AutoModel.from_pretrained(teacher_model_name).cuda()
+
+    collator = DataCollatorForWholeWordMask(tokenizer, mlm=True, mlm_probability=0.3)
+    for p in model.parameters():
+        p.requires_grad = True
+    optimizer = Adafactor(
+        [p for p in model.parameters() if p.requires_grad],
+        scale_parameter=False, relative_step=False,
+        lr=2e-6,  # make it very slow, because we want to update too many parameters
+        clip_threshold=1.0
+    )
+    loss_fn = torch.nn.CrossEntropyLoss()
+    mlm_batch_size = 2
+    batch_size = 4
+    margin = 0.3
+    losses2 = []
+    accuracies2 = []
+    losses_mlm = []
+    losses_ce = []
+    model.train()
+    tq = trange(300_000)
+    for i in tq:
+        kjh_examples, ru_examples = [list(p) for p in zip(*random.choices(all_pairs, k=batch_size))]
+        try:
+            # translation ranking step
+            # in half cases, pull embeddings to the teacher; in other half - to self.
+            tm, tt = (teacher_model, teacher_tokenizer) if random.random() < 0.5 else (model.bert, tokenizer)
+            ru_batch = tt(ru_examples, return_tensors='pt', padding=True, truncation=True, max_length=128)
+            with torch.no_grad():
+                ru_emb = torch.nn.functional.normalize(tm(**ru_batch.to(teacher_model.device)).pooler_output)
+
+            kjh_batch = tokenizer(kjh_examples, return_tensors='pt', padding=True, truncation=True, max_length=128)
+            kjh_emb = torch.nn.functional.normalize(model.bert(**kjh_batch.to(model.device)).pooler_output)
+
+            loss = get_contrastive_loss(ru_emb, kjh_emb, loss_fn, margin=margin)
+            loss.backward()
+            losses2.append(loss.item())
+            accuracies2.append(get_acc2(kjh_emb, ru_emb))
+
+            # mlm step
+            sents = random.choices(all_sentences, k=mlm_batch_size)
+            kjh_batch = {k: v.to(model.device) for k, v in collator([tokenizer(s) for s in sents]).items()}
+            loss = loss_fn(
+                model(**kjh_batch).prediction_logits.view(-1, model.config.vocab_size),
+                kjh_batch['labels'].view(-1)
+            )
+            loss.backward()
+            losses_mlm.append(loss.item())
+
+            # cross-encoder step
+            pp, pl = get_pairs_batch(bs=4)
+            loss = loss_fn(
+                model(
+                    **tokenizer(*pp, padding=True, truncation=True, max_length=128, return_tensors='pt').to(
+                        model.device)
+                ).seq_relationship_logits.view(-1, 2),
+                torch.tensor(pl, device=model.device)
+            )
+            loss.backward()
+            losses_ce.append(loss.item())
+
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        except RuntimeError:
+            optimizer.zero_grad(set_to_none=True)
+            batch, out, embeddings, all_scores, loss = None, None, None, None, None
+            cleanup()
+            print('error', max(len(s) for s in kjh_examples + ru_examples))
+            continue
+        if i % 100 == 0:
+            print(i, np.mean(losses2[-100:]), np.mean(accuracies2[-100:]), np.mean(losses_mlm[-100:]),
+                  np.mean(losses_ce[-100:]))
+
 
 
 if __name__ == '__main__':
