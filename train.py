@@ -4,6 +4,8 @@ import gc
 import pandas as pd
 from datetime import datetime
 from transformers.optimization import Adafactor
+from collections import deque
+from torch.optim import AdamW
 from transformers import AutoTokenizer, AutoModelForPreTraining, AutoModel, DataCollatorForWholeWordMask, \
     DataCollatorForLanguageModeling
 from torch.utils.tensorboard import SummaryWriter
@@ -28,34 +30,22 @@ def cleanup():
     torch.cuda.empty_cache()
 
 
-# def get_acc(embeddings):
-#     batch_size = embeddings.shape[0] // 2
-#     with torch.no_grad():
-#         scores = torch.matmul(
-#             embeddings[:batch_size].detach(),
-#             embeddings[batch_size:].T
-#         ).cpu().numpy()
-#     a1 = (scores.argmax(1) == np.arange(batch_size)).mean()
-#     a2 = (scores.argmax(0) == np.arange(batch_size)).mean()
-#     return (a1 + a2) / 2
-
 def get_acc(embs1, embs2):
     batch_size = embs1.shape[0]
     with torch.no_grad():
-        scores = torch.matmul(embs1, embs2.T).cpu().numpy()
+        scores = torch.matmul(embs1.float(), embs2.float().T).cpu().numpy()
     a1 = (scores.argmax(1) == np.arange(batch_size)).mean()
     a2 = (scores.argmax(0) == np.arange(batch_size)).mean()
     return (a1 + a2) / 2
 
 
-def get_contrastive_loss(embs1, embs2, loss_fn, margin=0.3):
+def get_contrastive_loss(embs1, embs2, loss_fn, margin=0.3, scale=20.0):
     bs = embs1.shape[0]
     d = embs1.device
-    embs1 = torch.nn.functional.normalize(embs1)
-    embs2 = torch.nn.functional.normalize(embs2)
     all_scores = torch.matmul(embs1, embs2.T)
     if margin:
         all_scores = all_scores - torch.eye(bs, device=d) * margin
+    all_scores = all_scores * scale
     diag_ids = torch.arange(bs, device=d)
 
     return loss_fn(all_scores, diag_ids) + loss_fn(all_scores.T, diag_ids)
@@ -80,9 +70,6 @@ def prepare_model(model_name, tokenizer):
         idx = tokenizer.convert_tokens_to_ids(token)
         embeds[idx] = embeds[old_ids].mean(0)
 
-    print('all', len(added_vocab))
-    print('unk_count', unk_count)
-
     return model
 
 
@@ -106,9 +93,9 @@ def train_v0():
     model = prepare_model(model_name, tokenizer)
 
     all_pairs = prepare_pairs(para_path, langs)
-    batch_size = 32
+    batch_size = 96
     margin = 0.3
-    num_steps = 500_000
+    num_steps = 100_000
 
     model.cuda()
 
@@ -119,10 +106,7 @@ def train_v0():
 
     loss_fn = torch.nn.CrossEntropyLoss()
 
-    optimizer = Adafactor(
-        [p for p in model.parameters() if p.requires_grad],
-        scale_parameter=False, relative_step=False, lr=1e-5, clip_threshold=1.0
-    )
+    optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4, weight_decay=0.01)
 
     losses = []
     accuracies = []
@@ -130,44 +114,30 @@ def train_v0():
     for i in range(num_steps):
         kjh_examples, ru_examples = [list(p) for p in zip(*random.choices(all_pairs, k=batch_size))]
         try:
-            # batch = tokenizer(ru_examples + kjh_examples,
-            #                   return_tensors='pt',
-            #                   padding=True,
-            #                   truncation=True,
-            #                   max_length=128).to(model.device)
-            # out = model.bert(**batch, output_hidden_states=True)
-            # embeddings = torch.nn.functional.normalize(out.pooler_output)
-            # embs1 = embeddings[:batch_size].detach()  # keep Russian embeddings frozen
-            # embs2 = embeddings[batch_size:]  # update Khakas embeddings
-            # 1. Русские примеры прогоняем без градиентов (экономит ~50% памяти)
-            with torch.no_grad():
-                ru_batch = tokenizer(ru_examples,
-                                     return_tensors='pt',
-                                     padding=True,
-                                     truncation=True,
-                                     max_length=128).to(model.device)
-                ru_out = model.bert(
-                    **ru_batch)  # output_hidden_states=True здесь не обязательно, если используете pooler_output
-                embs1 = torch.nn.functional.normalize(ru_out.pooler_output).detach()
+            ru_batch = tokenizer(ru_examples, return_tensors='pt', padding=True, truncation=True,
+                                 max_length=128).to(model.device)
 
-            # 2. Хакасские примеры прогоняем с вычислением градиентов
-            kjh_batch = tokenizer(kjh_examples,
-                                  return_tensors='pt',
-                                  padding=True,
-                                  truncation=True,
+            kjh_batch = tokenizer(kjh_examples, return_tensors='pt', padding=True, truncation=True,
                                   max_length=128).to(model.device)
-            kjh_out = model.bert(**kjh_batch)
-            embs2 = torch.nn.functional.normalize(kjh_out.pooler_output)
 
-            loss = get_contrastive_loss(embs1, embs2, loss_fn, margin=margin)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                with torch.no_grad():
+                    ru_out = model.bert(
+                        **ru_batch)
+                    embs1 = torch.nn.functional.normalize(ru_out.pooler_output).detach()
+
+                kjh_out = model.bert(**kjh_batch)
+                embs2 = torch.nn.functional.normalize(kjh_out.pooler_output)
+
+                loss = get_contrastive_loss(embs1.float(), embs2.float(), loss_fn, margin=margin)
 
             loss.backward()
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
             losses.append(loss.item())
-            # accuracies.append(get_acc(embeddings))
             accuracies.append(get_acc(embs1, embs2))
+
         except RuntimeError:
             optimizer.zero_grad(set_to_none=True)
             batch, out, embeddings, all_scores, loss = None, None, None, None, None
@@ -180,25 +150,16 @@ def train_v0():
             break
 
         if i % 100 == 0 and i > 0:
-            writer.add_scalar("train/loss_mean_1000", np.mean(losses[-1000:]), i)
-            writer.add_scalar("train/accuracy_mean_1000", np.mean(accuracies[-1000:]), i)
+            writer.add_scalar("train/loss", np.mean(losses[-100:]), i)
+            writer.add_scalar("train/accuracy", np.mean(accuracies[-100:]), i)
             writer.flush()
 
-            print(f"Step {i} | Loss: {np.mean(losses[-1000:]):.4f} | Accuracy: {np.mean(accuracies[-1000:]):.4f}\n")
+            print(f"Step {i} | Loss: {np.mean(losses[-100:]):.4f} | Accuracy: {np.mean(accuracies[-100:]):.4f}\n")
 
     model_path = f"{model_dir}/labse_kjh_ru_v0"
     model.save_pretrained(model_path)
     tokenizer.save_pretrained(model_path)
     writer.close()
-
-
-def get_acc2(e1, e2):
-    batch_size = e1.shape[0]
-    with torch.no_grad():
-        scores = torch.matmul(e1, e2.T).cpu().numpy()
-    a1 = (scores.argmax(1) == np.arange(batch_size)).mean()
-    a2 = (scores.argmax(0) == np.arange(batch_size)).mean()
-    return (a1 + a2) / 2
 
 
 def corrupt_sentence(sent, ix, all_pairs, p_edit=0.5):
@@ -250,7 +211,7 @@ def train_v1():
     art_dir = './artifacts'
     tkn_dir = f'{art_dir}/tokenizer_with_kjh'
     para_path = '/home/adeshkin/khakas_projects/khakas-mt/data/final/para_kjh_ru.csv'
-    base_model_path = './artifacts/model_checkpoints/labse_finetune_kjh_ru_20260324_120536/labse_kjh_ru_v0'
+    base_model_path = './artifacts/model_checkpoints/labse_finetune_kjh_ru_20260324_172236/labse_kjh_ru_v0'
 
     langs = ['kjh', 'ru']
     log_dir = f'{art_dir}/logs'
@@ -272,25 +233,26 @@ def train_v1():
     teacher_model_name = 'cointegrated/LaBSE-en-ru'
     teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_name)
     teacher_model = AutoModel.from_pretrained(teacher_model_name).cuda()
+    teacher_model.eval()
+    teacher_model.requires_grad_(False)
 
-    # collator = DataCollatorForWholeWordMask(tokenizer, mlm=True, mlm_probability=0.3)
-    collator = DataCollatorForLanguageModeling(tokenizer, mlm=True, whole_word_mask=True, mlm_probability=0.3)
+    mlm_probability = 0.15
+    collator = DataCollatorForLanguageModeling(tokenizer, mlm=True, whole_word_mask=True,
+                                               mlm_probability=mlm_probability, mask_replace_prob=1)
     for p in model.parameters():
         p.requires_grad = True
-    optimizer = Adafactor(
-        [p for p in model.parameters() if p.requires_grad],
-        scale_parameter=False, relative_step=False,
-        lr=2e-6,  # make it very slow, because we want to update too many parameters
-        clip_threshold=1.0
-    )
+
+    optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4, weight_decay=0.01)
+
     loss_fn = torch.nn.CrossEntropyLoss()
-    mlm_batch_size = 2
-    batch_size = 4
+    mlm_batch_size = 16  # 2
+    ce_batch_size = 16  # 4
+    batch_size = 32  # 4
     margin = 0.3
-    losses2 = []
-    accuracies2 = []
-    losses_mlm = []
-    losses_ce = []
+    losses2 = deque(maxlen=100)
+    accuracies2 = deque(maxlen=100)
+    losses_mlm = deque(maxlen=100)
+    losses_ce = deque(maxlen=100)
     model.train()
     tq = trange(300_000)
     for i in tq:
@@ -300,21 +262,22 @@ def train_v1():
             # in half cases, pull embeddings to the teacher; in other half - to self.
             tm, tt = (teacher_model, teacher_tokenizer) if random.random() < 0.5 else (model.bert, tokenizer)
             ru_batch = tt(ru_examples, return_tensors='pt', padding=True, truncation=True, max_length=128)
-            with torch.no_grad():
-                ru_emb = torch.nn.functional.normalize(tm(**ru_batch.to(teacher_model.device)).pooler_output)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                with torch.no_grad():
+                    ru_emb = torch.nn.functional.normalize(tm(**ru_batch.to(teacher_model.device)).pooler_output)
 
-            kjh_batch = tokenizer(kjh_examples, return_tensors='pt', padding=True, truncation=True, max_length=128)
-            kjh_emb = torch.nn.functional.normalize(model.bert(**kjh_batch.to(model.device)).pooler_output)
+                kjh_batch = tokenizer(kjh_examples, return_tensors='pt', padding=True, truncation=True, max_length=128)
+                kjh_emb = torch.nn.functional.normalize(model.bert(**kjh_batch.to(model.device)).pooler_output)
 
-            loss = get_contrastive_loss(ru_emb, kjh_emb, loss_fn, margin=margin)
+                loss = get_contrastive_loss(ru_emb.float(), kjh_emb.float(), loss_fn, margin=margin, scale=1)
+
             loss.backward()
             losses2.append(loss.item())
-            accuracies2.append(get_acc2(kjh_emb, ru_emb))
+            accuracies2.append(get_acc(kjh_emb, ru_emb))
 
             # mlm step
             sents = random.choices(all_kjh_sents, k=mlm_batch_size)
-            # 1. Tokenize EVERYTHING at once.
-            # This creates the 'offset_mapping' as a [2, N, 2] tensor immediately.
+
             encodings = tokenizer(
                 sents,
                 padding=True,
@@ -324,23 +287,19 @@ def train_v1():
                 return_tensors="pt"  # This is the critical part
             )
 
-            # 2. Convert the batch of tensors into a list of dicts (features)
-            # Each 'item' will contain 1D tensors (e.g., input_ids is [N], offset_mapping is [N, 2])
             features = []
             for j in range(len(sents)):
                 item = {key: val[j] for key, val in encodings.items()}
                 features.append(item)
 
-            # 3. Pass to collator.
-            # Because the features are already tensors, the collator will stack them
-            # into a 3D tensor perfectly, and 'offsets[:, :, 0]' will work.
             kjh_batch = {k: v.to(model.device) for k, v in collator(features).items()}
 
             if (kjh_batch['labels'] != -100).any():
-                loss = loss_fn(
-                    model(**kjh_batch).prediction_logits.view(-1, model.config.vocab_size),
-                    kjh_batch['labels'].view(-1)
-                )
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    loss = loss_fn(
+                        model(**kjh_batch).prediction_logits.view(-1, model.config.vocab_size),
+                        kjh_batch['labels'].view(-1)
+                    )
                 # Дополнительная проверка на аномальные значения
                 if not torch.isnan(loss):
                     loss.backward()
@@ -351,14 +310,11 @@ def train_v1():
                 print("No tokens masked in this batch, skipping step")
 
             # cross-encoder step
-            pp, pl = get_pairs_batch(short_pairs, bs=4)
-            loss = loss_fn(
-                model(
-                    **tokenizer(*pp, padding=True, truncation=True, max_length=128, return_tensors='pt').to(
-                        model.device)
-                ).seq_relationship_logits.view(-1, 2),
-                torch.tensor(pl, device=model.device)
-            )
+            pp, pl = get_pairs_batch(short_pairs, bs=ce_batch_size)
+            pp_tok = tokenizer(*pp, padding=True, truncation=True, max_length=128, return_tensors='pt').to(model.device)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                loss = loss_fn(model(**pp_tok).seq_relationship_logits.view(-1, 2), torch.tensor(pl,
+                                                                                                 device=model.device))
             loss.backward()
             losses_ce.append(loss.item())
 
@@ -377,14 +333,14 @@ def train_v1():
             break
 
         if i % 100 == 0:
-            writer.add_scalar("train/loss_mean_100", np.mean(losses2[-100:]), i)
-            writer.add_scalar("train/accuracy_mean_100", np.mean(accuracies2[-100:]), i)
-            writer.add_scalar("train/loss_mlm_mean_100", np.mean(losses_mlm[-100:]), i)
-            writer.add_scalar("train/loss_ce_mean_100", np.mean(losses_ce[-100:]), i)
+            writer.add_scalar("train/loss", np.mean(losses2), i)
+            writer.add_scalar("train/accuracy", np.mean(accuracies2), i)
+            writer.add_scalar("train/loss_mlm", np.mean(losses_mlm), i)
+            writer.add_scalar("train/loss_ce", np.mean(losses_ce), i)
             writer.flush()
 
-            print(f"Step {i} | Loss: {np.mean(losses2[-100:]):.4f} | Accuracy: {np.mean(accuracies2[-100:]):.4f}"
-                  f" | MLM Loss: {np.mean(losses_mlm[-100:]):.4f} | CE Loss: {np.mean(losses_ce[-100:]):.4f}\n")
+            print(f"Step {i} | Loss: {np.mean(losses2):.4f} | Accuracy: {np.mean(accuracies2):.4f}"
+                  f" | MLM Loss: {np.mean(losses_mlm):.4f} | CE Loss: {np.mean(losses_ce):.4f}\n")
 
     model_path = f"{model_dir}/labse_kjh_ru_v1"
     model.save_pretrained(model_path)
@@ -393,4 +349,4 @@ def train_v1():
 
 
 if __name__ == '__main__':
-    train_v0()
+    train_v1()
