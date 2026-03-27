@@ -1,5 +1,5 @@
 # khakas-sent-emb
-
+# new name
 https://huggingface.co/sentence-transformers/LaBSE
 https://huggingface.co/cointegrated/LaBSE-en-ru
 
