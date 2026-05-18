@@ -185,24 +185,25 @@ def main():
     embeds = model.bert.embeddings.word_embeddings.weight.data
 
     added_vocab = set(tokenizer.get_vocab().keys()).difference(set(old_tokenizer.get_vocab().keys()))
+    unk_id = old_tokenizer.unk_token_id
     for token in added_vocab:
         clean_token = token.replace("##", "")
         old_ids = old_tokenizer(clean_token, add_special_tokens=False).input_ids
-        assert len(old_ids) != 0
-        idx = tokenizer.convert_tokens_to_ids(token)
-        embeds[idx] = embeds[old_ids].mean(0)
+        if len(old_ids) != 0 and unk_id not in old_ids:
+            idx = tokenizer.convert_tokens_to_ids(token)
+            embeds[idx] = embeds[old_ids].mean(0)
 
     training_args = TrainingArguments(
         output_dir="/content/drive/MyDrive/experiments/labse-en-ru_kjh-mlm",
         eval_strategy="steps",
         save_strategy="best",
-        learning_rate=1e-4,
+        learning_rate=5e-5,
         num_train_epochs=10,
-        per_device_train_batch_size=64,
-        per_device_eval_batch_size=64,
+        per_device_train_batch_size=32,
+        per_device_eval_batch_size=32,
         weight_decay=0.01,
         fp16=True,
-        logging_steps=100,
+        logging_steps=500,
         report_to="none",
         push_to_hub=False,
         load_best_model_at_end=True,
