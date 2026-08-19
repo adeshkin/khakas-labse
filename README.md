@@ -1,5 +1,8 @@
 # khakas-sent-emb
 
+> **Обученная модель:** [adeshkin/labse-kjh-ru-mnrl-1](https://huggingface.co/adeshkin/labse-kjh-ru-mnrl-1)  
+> Модель обучена по скрипту `experiments/finetune_mnrl_1.py`.
+
 Обучение sentence-эмбеддингов для хакасского языка (kjh) на базе [LaBSE](https://huggingface.co/sentence-transformers/LaBSE) / [LaBSE-en-ru](https://huggingface.co/cointegrated/LaBSE-en-ru).
 
 ## Идея пайплайна
